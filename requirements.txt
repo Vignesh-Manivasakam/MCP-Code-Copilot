@@ -1,0 +1,14 @@
+# Python >= 3.10 required (tested with 3.12)
+
+# Core Framework
+fastmcp>=2.0.0
+uvicorn>=0.27.0
+starlette>=0.36.0
+
+# File Operations
+chardet>=5.2.0              # Encoding detection
+aiofiles>=23.2.1            # Async file operations
+
+# Development
+pytest>=7.4.0               # Testing
+pytest-asyncio>=0.21.0      # Async testing

@@ -1,90 +1,95 @@
-# Code Copilot MCP Server
+# 🤖 Code Copilot MCP Server
 
-An MCP (Model Context Protocol) server that gives AI assistants secure, read/write access to a single project folder.  Built with **FastMCP v2** and **Starlette / Uvicorn**.
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![FastMCP](https://img.shields.io/badge/Framework-FastMCP_v2-green.svg)](https://github.com/modelcontextprotocol/python-sdk)
+[![Starlette](https://img.shields.io/badge/Server-Starlette-blue.svg)](https://www.starlette.io/)
+[![Uvicorn](https://img.shields.io/badge/ASGI-Uvicorn-blue.svg)](https://www.uvicorn.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+<p align="center">
+  <img src="assets/MCP.png" alt="MCP Server Architecture" width="800"/>
+  <br>
+  <em>Secure Model Context Protocol sandbox controller with file inspection metrics</em>
+</p>
+
+An enterprise-ready **Model Context Protocol (MCP)** server that gives LLM assistants (such as Claude Desktop or cursor) secure, read-write access to a single designated project folder. Built with **FastMCP v2** and **Starlette / Uvicorn**, it implements middleware safeguards and path validators to protect against system traversal.
 
 ---
 
-## Features
+## 🏗️ Architecture & Security Model
 
-- 10 Tier-1 file-operation tools (read, write, create, list, search, …)
-- Hard sandbox – access is restricted to a single project root directory
-- Path-traversal protection (blocks `../`, absolute paths, symlink escapes)
-- Automatic file-encoding detection via `chardet`
-- Binary-file detection
-- CORS + request-logging middleware
-- `/health` and `/project-info` HTTP endpoints
+The server acts as a validated bridge between an external AI client and your filesystem:
 
----
-
-## Project Structure
-
+```mermaid
+graph TD
+    Client["AI Client (e.g., Claude Desktop)"] -->|MCP Tool Calls| Server["Starlette MCP Server"]
+    Server --> Logger["Logging & CORS Middleware"]
+    Logger --> Validator{"Path Sandbox Validator"}
+    Validator -->|Security Violation| Reject["Error Response (Rejects '..', absolute paths, symlink escapes)"]
+    Validator -->|Safe Path| Tools["10 Tier-1 File Tools"]
+    Tools --> Filesystem[("Project Filesystem")]
 ```
-code-copilot-mcp/
-├── server.py                 # Entry point
-├── config.py                 # Configuration constants
-├── requirements.txt
-│
+
+### Sandbox Protections:
+* **Relative Path Checks**: Absolute paths are blocked.
+* **Directory Traversal Blocking**: Any path components containing `..` are explicitly rejected.
+* **Symlink Escaping Protection**: Resolves all symbolic links using `Path.resolve()` and checks that the resolved target path begins with the designated `PROJECT_ROOT` prefix.
+
+---
+
+## 🛠️ Tool Registry
+
+The server registers 10 high-performance tools:
+1. `read_file`: Reads files safely with auto-encoding detection via `chardet`.
+2. `write_file`: Overwrites files (with optional automatic `.bak` backups).
+3. `create_file`: Initializes a new file.
+4. `list_files`: Scans directories using glob filters.
+5. `get_file_structure`: Generates a nested directory tree with configurable depth.
+6. `search_in_files`: Runs regex/text searches.
+7. `find_function`: Extracts function and method definitions.
+8. `find_references`: Scans for whole-word occurrences of a symbol.
+9. `get_file_info`: Retrieves size, encoding, and syntax language.
+10. `analyze_file`: Calculates code metrics (lines, classes, functions, imports).
+
+---
+
+## 📁 Repository Directory Structure
+
+```text
+MCP-Code-Copilot/
 ├── middleware/
-│   ├── security.py           # Path validation
-│   └── logging.py            # Request/response logging
-│
+│   ├── security.py           # Path validation and sandbox rules
+│   └── logging.py            # Event logging middleware
 ├── tools/
 │   └── file_operations.py    # All 10 file tools
-│
 ├── utils/
 │   ├── encoding_detector.py  # chardet-based encoding detection
-│   ├── file_validator.py     # Helpers (binary check, size formatting, …)
+│   ├── file_validator.py     # Helpers (binary checks, size calculations)
 │   └── error_handler.py      # Standardised error responses
-│
-└── prompts/
-    └── skills.md             # System instructions for the AI client
+├── prompts/
+│   ├── skills.md             # System instructions for AI client
+│   └── image_prompt_MCP_Code_Copilot.md # ChatGPT design prompts
+├── config.py                 # Configuration constants
+├── requirements.txt          # Python dependencies
+└── server.py                 # Starlette web server entry point
 ```
 
 ---
 
-## Requirements
+## 🚀 Installation & Quick Start
 
-- Python 3.10+
-- See `requirements.txt` for package dependencies
-
----
-
-## Quick Start
-
-### 1 – Create and activate a virtual environment
-
-```bash
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# macOS / Linux
-source .venv/bin/activate
-```
-
-### 2 – Install dependencies
-
+### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3 – Start the server
-
+### 2. Launch the Server
+Start the server and pass the target sandbox folder path:
 ```bash
-python server.py /path/to/your/project
+python server.py /path/to/your/sandbox/project --port 8000
 ```
-
-Optional flags:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port` | `8000` | TCP port |
-| `--host` | `127.0.0.1` | Bind address (`0.0.0.0` for all interfaces) |
-
-The server will print:
-
-```
+Upon startup, the server console will display:
+```text
 ============================================================
 🚀 Code Copilot MCP Server  v1.0.0
 ============================================================
@@ -94,83 +99,8 @@ The server will print:
 ============================================================
 ```
 
-### 4 – Alternative: set the project root via environment variable
-
-```bash
-export PROJECT_ROOT=/path/to/your/project
-python server.py .   # argument is still required but ignored when env var is set
-```
-
----
-
-## Available Tools
-
-| # | Tool | Description |
-|---|------|-------------|
-| 1 | `read_file` | Read file content with encoding detection |
-| 2 | `write_file` | Write / overwrite a file (optional `.bak` backup) |
-| 3 | `create_file` | Create a new file with optional initial content |
-| 4 | `list_files` | List directory contents with glob filtering |
-| 5 | `get_file_structure` | Nested project tree up to a configurable depth |
-| 6 | `search_in_files` | Full-text search across the project |
-| 7 | `find_function` | Locate function / method definitions |
-| 8 | `find_references` | Find all usages of a symbol (whole-word) |
-| 9 | `get_file_info` | Detailed file metadata (size, encoding, language, …) |
-| 10 | `analyze_file` | Code metrics: line counts, functions, classes, imports |
-
----
-
-## Configuration
-
-All tuneable constants live in `config.py`.  The most important ones:
-
-| Constant | Default | Purpose |
-|----------|---------|---------|
-| `FILE_SIZE_WARNING_THRESHOLD` | 1 MB | Warn when reading large files |
-| `FILE_SIZE_MAX_READ` | 50 MB | Hard limit for `read_file` |
-| `MAX_WRITE_SIZE` | 10 MB | Hard limit for `write_file` |
-| `MAX_SEARCH_RESULTS` | 100 | Upper bound on search results |
-| `SEARCH_TIMEOUT_SECONDS` | 10 | Abort search after this many seconds |
-| `LOG_LEVEL` | `INFO` (env: `LOG_LEVEL`) | Python logging level |
-
----
-
-## Security Model
-
-The server enforces a **strict single-folder sandbox**:
-
-1. All paths supplied to any tool are validated before any filesystem access.
-2. Absolute paths are rejected outright.
-3. Paths containing `..` components are rejected before resolution.
-4. After `Path.resolve()` (which follows symlinks), the resolved path must start with `PROJECT_ROOT`.  Any path that escapes the sandbox is rejected with a `SECURITY_VIOLATION` error.
-
----
-
-## Endpoints
-
-| Path | Method | Description |
-|------|--------|-------------|
-| `/health` | GET | Plain-text health check |
-| `/` | GET | Alias for `/health` |
-| `/project-info` | GET | JSON project statistics |
-| `/mcp` | GET + POST | MCP protocol endpoint |
-
----
-
-## Running Tests
-
-```bash
-pytest
-```
-
-(Test files go in a `tests/` directory – see the Phase 1 testing checklist for manual test cases.)
-
----
-
-## MCP Client Configuration
-
-To connect an MCP client (e.g. Claude Desktop, or a VS Code extension) point it at the `/mcp` endpoint:
-
+### 3. Register with Claude Desktop
+Add the server config parameters to your `claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
@@ -180,11 +110,3 @@ To connect an MCP client (e.g. Claude Desktop, or a VS Code extension) point it 
   }
 }
 ```
-
-Attach `prompts/skills.md` as the system prompt / instructions file so the AI client knows how to use the available tools effectively.
-
----
-
-## Licence
-
-MIT

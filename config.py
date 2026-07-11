@@ -23,6 +23,41 @@ class Config:
     FILE_SIZE_MAX_READ = 50 * 1024 * 1024            # 50 MB – reject read
     MAX_WRITE_SIZE = 10 * 1024 * 1024               # 10 MB – reject write
 
+    # Traversal Exclusions
+    IGNORED_DIRS = {
+        ".git",
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        "build",
+        "dist",
+        ".vscode",
+        ".idea",
+    }
+
+    # Command Execution Whitelist
+    ALLOWED_COMMANDS = {
+        "python",
+        "pytest",
+        "npm",
+        "pip",
+        "poetry",
+        "uv",
+        "cargo",
+        "go",
+        "dotnet",
+        "ruff",
+        "black",
+        "flake8",
+        "git",
+        "node",
+    }
+
+    # File Read Registry (resolved_path -> { "content": str, "timestamp": float })
+    FILE_READ_REGISTRY = {}
+
     # Search Limits
     MAX_SEARCH_RESULTS = 100
     SEARCH_TIMEOUT_SECONDS = 10

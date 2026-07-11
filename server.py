@@ -31,6 +31,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 
 from config import Config
 from tools.file_operations import register_file_tools
+from utils.file_validator import walk_safe_paths
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -64,7 +65,7 @@ def health_check(request: Request) -> PlainTextResponse:
         )
 
     try:
-        file_count = sum(1 for p in Config.PROJECT_ROOT.rglob("*") if p.is_file())
+        file_count = sum(1 for p in walk_safe_paths(Config.PROJECT_ROOT, "*", recursive=True) if p.is_file())
     except Exception:  # noqa: BLE001
         file_count = -1
 
@@ -74,7 +75,7 @@ def health_check(request: Request) -> PlainTextResponse:
         f"Project : {Config.PROJECT_ROOT.name}\n"
         f"Path    : {Config.PROJECT_ROOT}\n"
         f"Files   : {file_count}\n"
-        f"Tools   : 10  (Tier 1 – file operations)\n\n"
+        f"Tools   : 12  (Super Copilot – file & commands)\n\n"
         f"MCP endpoint : /mcp\n"
     )
     return PlainTextResponse(body)
@@ -87,7 +88,7 @@ def project_info(request: Request) -> JSONResponse:
         return JSONResponse({"error": "No project configured"}, status_code=503)
 
     root = Config.PROJECT_ROOT
-    all_entries = list(root.rglob("*"))
+    all_entries = list(walk_safe_paths(root, "*", recursive=True))
 
     extension_counts: dict = {}
     total_size = 0

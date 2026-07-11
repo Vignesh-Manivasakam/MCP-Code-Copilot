@@ -1,7 +1,10 @@
 """
 File validation utilities for Code Copilot MCP Server
 """
+import os
+import fnmatch
 from pathlib import Path
+from typing import Generator
 
 from config import Config
 
@@ -112,3 +115,45 @@ def detect_language_from_extension(file_path: Path) -> str:
         Language name string, or ``"Unknown"`` if the extension is not mapped.
     """
     return _EXTENSION_MAP.get(file_path.suffix.lower(), "Unknown")
+
+
+def walk_safe_paths(
+    root: Path,
+    pattern: str = "*",
+    recursive: bool = True,
+) -> Generator[Path, None, None]:
+    """
+    Yield paths under *root* matching *pattern*, skipping ignored directories in Config.IGNORED_DIRS.
+    """
+    ignored = getattr(Config, "IGNORED_DIRS", set())
+
+    if not recursive:
+        # Just use simple glob but filter out ignored
+        try:
+            for p in root.glob(pattern):
+                if p.name not in ignored:
+                    yield p
+        except OSError:
+            pass
+        return
+
+    # Recursive walk
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune ignored directories in-place so we don't descend into them
+        dirnames[:] = [d for d in dirnames if d not in ignored]
+
+        path_dir = Path(dirpath)
+
+        # Match files and directories that match the pattern
+        for name in dirnames + filenames:
+            full_path = path_dir / name
+            try:
+                rel_path = full_path.relative_to(root)
+            except ValueError:
+                continue
+
+            rel_str = str(rel_path).replace("\\", "/")
+
+            # Match the relative path string or the name itself
+            if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(rel_str, pattern):
+                yield full_path

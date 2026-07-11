@@ -21,6 +21,7 @@ from utils.file_validator import (
     detect_language_from_extension,
     get_file_size_human,
     should_warn_file_size,
+    walk_safe_paths,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,7 @@ def _build_tree(
                     key=lambda p: (p.is_file(), p.name.lower()),
                 )
                 for child in entries:
-                    if not include_hidden and child.name.startswith("."):
+                    if not include_hidden and (child.name.startswith(".") or child.name in Config.IGNORED_DIRS):
                         continue
                     # Skip symlink loops
                     try:
@@ -180,6 +181,15 @@ def register_file_tools(mcp) -> List[str]:
                 f"Failed to read file: {exc}",
                 {"file_path": file_path},
             )
+
+        # Track file read state for staleness validation
+        try:
+            Config.FILE_READ_REGISTRY[resolved] = {
+                "content": content,
+                "timestamp": resolved.stat().st_mtime
+            }
+        except OSError:
+            pass
 
         lines = content.splitlines()
         total_lines = len(lines)
@@ -513,7 +523,7 @@ def register_file_tools(mcp) -> List[str]:
         truncated = False
         deadline = time.monotonic() + Config.SEARCH_TIMEOUT_SECONDS
 
-        for file_path in Config.PROJECT_ROOT.rglob(file_pattern):
+        for file_path in walk_safe_paths(Config.PROJECT_ROOT, file_pattern, recursive=True):
             if time.monotonic() > deadline:
                 truncated = True
                 break
@@ -610,7 +620,7 @@ def register_file_tools(mcp) -> List[str]:
 
         results: List[Dict[str, Any]] = []
 
-        for file_path in Config.PROJECT_ROOT.rglob(file_pattern):
+        for file_path in walk_safe_paths(Config.PROJECT_ROOT, file_pattern, recursive=True):
             if not file_path.is_file() or SecurityValidator.is_binary_file(file_path):
                 continue
 
@@ -680,7 +690,7 @@ def register_file_tools(mcp) -> List[str]:
 
         references: List[Dict[str, Any]] = []
 
-        for file_path in Config.PROJECT_ROOT.rglob(file_pattern):
+        for file_path in walk_safe_paths(Config.PROJECT_ROOT, file_pattern, recursive=True):
             if not file_path.is_file() or SecurityValidator.is_binary_file(file_path):
                 continue
 
@@ -970,7 +980,7 @@ def register_file_tools(mcp) -> List[str]:
         logger.info("Project root changed to: %s", resolved)
 
         try:
-            file_count = sum(1 for p in resolved.rglob("*") if p.is_file())
+            file_count = sum(1 for p in walk_safe_paths(resolved, "*", recursive=True) if p.is_file())
         except Exception:  # noqa: BLE001
             file_count = -1
 
@@ -983,6 +993,319 @@ def register_file_tools(mcp) -> List[str]:
             },
             f"✅ Project root set to: {resolved}  ({file_count} files found)",
         )
+
+    # ------------------------------------------------------------------
+    # Tool 11 – modify_file
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def modify_file(
+        file_path: str,
+        target_content: str,
+        replacement_content: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        allow_multiple: bool = False,
+        create_backup: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Modify a file by replacing a specific unique target_content block with replacement_content.
+        Optimized for making small changes without rewriting the entire file.
+
+        Args:
+            file_path:           Relative path to the target file.
+            target_content:      The exact block of text to find and replace.
+            replacement_content: The new block of text to replace it with.
+            start_line:          Optional 1-based start line to restrict the search area.
+            end_line:            Optional 1-based end line to restrict the search area.
+            allow_multiple:      If True, replaces all occurrences. If False (default), fails if target matches more than once.
+            create_backup:       When True, a `.bak` backup copy of the file is created before modifying.
+        """
+        if not target_content:
+            return create_error_response(
+                ErrorCode.INVALID_INPUT,
+                "target_content cannot be empty",
+                {"file_path": file_path},
+            )
+
+        is_valid, resolved, error_msg = SecurityValidator.validate_path(file_path)
+        if not is_valid:
+            return create_error_response(
+                ErrorCode.SECURITY_VIOLATION, error_msg, {"file_path": file_path}
+            )
+
+        is_readable, read_err = SecurityValidator.check_file_readable(resolved)
+        if not is_readable:
+            return create_error_response(
+                ErrorCode.FILE_NOT_FOUND if not resolved.exists() else ErrorCode.PERMISSION_DENIED,
+                read_err,
+                {"file_path": file_path},
+            )
+
+        is_writable, write_err = SecurityValidator.check_file_writable(resolved)
+        if not is_writable:
+            return create_error_response(
+                ErrorCode.PERMISSION_DENIED, write_err, {"file_path": file_path}
+            )
+
+        if SecurityValidator.is_binary_file(resolved):
+            return create_error_response(
+                ErrorCode.BINARY_FILE_ERROR, "Cannot edit binary file", {"file_path": file_path}
+            )
+
+        # Read current content and encoding
+        try:
+            content, encoding = read_file_with_encoding(resolved)
+        except Exception as exc:
+            return create_error_response(
+                ErrorCode.READ_ERROR, f"Failed to read file: {exc}", {"file_path": file_path}
+            )
+
+        # Check Read-Staleness
+        mtime = resolved.stat().st_mtime
+        read_state = Config.FILE_READ_REGISTRY.get(resolved)
+        if read_state:
+            # If modification time is newer than read time, check if content has actually changed
+            if mtime > read_state["timestamp"] and content != read_state["content"]:
+                return create_error_response(
+                    ErrorCode.WRITE_ERROR,
+                    "File has been modified since it was last read. Please read the file again to refresh your context.",
+                    {"file_path": file_path},
+                )
+
+        # Split content into lines preserving newlines
+        lines = content.splitlines(keepends=True)
+        total_lines = len(lines)
+
+        # Validate line bounds
+        start_idx = 0
+        end_idx = total_lines
+
+        if start_line is not None:
+            if start_line < 1 or start_line > total_lines:
+                return create_error_response(
+                    ErrorCode.INVALID_INPUT,
+                    f"start_line ({start_line}) is out of bounds (file has {total_lines} lines)",
+                    {"file_path": file_path},
+                )
+            start_idx = start_line - 1
+
+        if end_line is not None:
+            if end_line < 1 or end_line > total_lines:
+                return create_error_response(
+                    ErrorCode.INVALID_INPUT,
+                    f"end_line ({end_line}) is out of bounds (file has {total_lines} lines)",
+                    {"file_path": file_path},
+                )
+            if start_line is not None and end_line < start_line:
+                return create_error_response(
+                    ErrorCode.INVALID_INPUT,
+                    f"end_line ({end_line}) cannot be less than start_line ({start_line})",
+                    {"file_path": file_path},
+                )
+            end_idx = end_line
+
+        # Extract search area
+        search_block = "".join(lines[start_idx:end_idx])
+
+        # Normalize quotes and newlines helper
+        def normalize_quotes(s: str) -> str:
+            return s.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+
+        # Normalize line endings
+        target_norm = target_content.replace("\r\n", "\n")
+        replacement_norm = replacement_content.replace("\r\n", "\n")
+
+        # Attempt exact match first
+        actual_target = target_norm
+        match_index = search_block.find(target_norm)
+        normalization_applied = False
+
+        # Fallback to normalized quotes comparison
+        if match_index == -1:
+            sb_norm_quotes = normalize_quotes(search_block)
+            target_norm_quotes = normalize_quotes(target_norm)
+            match_index = sb_norm_quotes.find(target_norm_quotes)
+            if match_index != -1:
+                # Retrieve actual string matching in original search_block
+                actual_target = search_block[match_index:match_index + len(target_norm)]
+                normalization_applied = True
+
+        if match_index == -1:
+            return create_error_response(
+                ErrorCode.INVALID_INPUT,
+                f"The target block was not found in the file{' (within the specified lines)' if (start_line or end_line) else ''}.",
+                {"file_path": file_path, "target_content": target_content},
+            )
+
+        # Preserve quote style if normalized comparison was used
+        if normalization_applied:
+            def preserve_quote_style(old_str: str, actual_old_str: str, new_str: str) -> str:
+                has_double = "“" in actual_old_str or "”" in actual_old_str
+                has_single = "‘" in actual_old_str or "’" in actual_old_str
+                if not has_double and not has_single:
+                    return new_str
+                res = new_str
+                if has_double:
+                    chars = list(res)
+                    res_chars = []
+                    for i, c in enumerate(chars):
+                        if c == '"':
+                            is_opening = (i == 0) or (chars[i-1] in (" ", "\t", "\n", "\r", "(", "[", "{"))
+                            res_chars.append("“" if is_opening else "”")
+                        else:
+                            res_chars.append(c)
+                    res = "".join(res_chars)
+                if has_single:
+                    chars = list(res)
+                    res_chars = []
+                    for i, c in enumerate(chars):
+                        if c == "'":
+                            is_contraction = (i > 0 and i < len(chars) - 1 and chars[i-1].isalpha() and chars[i+1].isalpha())
+                            if is_contraction:
+                                res_chars.append("’")
+                            else:
+                                is_opening = (i == 0) or (chars[i-1] in (" ", "\t", "\n", "\r", "(", "[", "{"))
+                                res_chars.append("‘" if is_opening else "’")
+                        else:
+                            res_chars.append(c)
+                    res = "".join(res_chars)
+                return res
+
+            replacement_norm = preserve_quote_style(target_norm, actual_target, replacement_norm)
+
+        # Check uniqueness in the search area
+        if allow_multiple:
+            matches_count = search_block.count(actual_target)
+        else:
+            # Check normalized quotes count to prevent duplicate matches under either representation
+            sb_quotes_norm = normalize_quotes(search_block)
+            target_quotes_norm = normalize_quotes(target_norm)
+            matches_count = sb_quotes_norm.count(target_quotes_norm)
+
+        if matches_count > 1 and not allow_multiple:
+            return create_error_response(
+                ErrorCode.INVALID_INPUT,
+                f"Found {matches_count} matches for the target block. Please provide more surrounding context to uniquely identify the match.",
+                {"file_path": file_path, "matches_found": matches_count},
+            )
+
+        # Perform replacement
+        if allow_multiple:
+            new_search_block = search_block.replace(actual_target, replacement_norm)
+        else:
+            new_search_block = search_block.replace(actual_target, replacement_norm, 1)
+
+        # Reconstruct updated content
+        new_content = "".join(lines[:start_idx]) + new_search_block + "".join(lines[end_idx:])
+
+        # Create backup if requested
+        backup_created = False
+        if create_backup:
+            backup_path = resolved.with_suffix(resolved.suffix + ".bak")
+            try:
+                shutil.copy2(resolved, backup_path)
+                backup_created = True
+            except OSError as exc:
+                logger.warning("Could not create backup for %s: %s", resolved, exc)
+
+        # Write content back
+        try:
+            with open(resolved, "w", encoding=encoding) as fh:
+                fh.write(new_content)
+        except OSError as exc:
+            return create_error_response(
+                ErrorCode.WRITE_ERROR, f"Failed to write file: {exc}", {"file_path": file_path}
+            )
+
+        # Update read registry
+        try:
+            mtime_new = resolved.stat().st_mtime
+            Config.FILE_READ_REGISTRY[resolved] = {
+                "content": new_content,
+                "timestamp": mtime_new,
+            }
+        except OSError:
+            pass
+
+        lines_changed = abs(len(new_content.splitlines()) - total_lines)
+        return create_success_response(
+            {
+                "file_path": file_path,
+                "action": "modified",
+                "lines_changed": lines_changed,
+                "backup_created": backup_created,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Tool 12 – execute_command
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def execute_command(
+        command: str, arguments: List[str] = []
+    ) -> Dict[str, Any]:
+        """
+        Execute a whitelisted development command (e.g. pytest, python, npm run test) in the project root.
+        Highly secure: commands are sandboxed to the project directory and whitelisted to prevent system exploitation.
+
+        Args:
+            command:   The command to execute (e.g., "pytest", "python", "npm", "git").
+            arguments: List of arguments to pass to the command.
+        """
+        import subprocess
+
+        if Config.PROJECT_ROOT is None:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR, "Server not configured: PROJECT_ROOT is not set"
+            )
+
+        # Verify whitelisted command
+        allowed = getattr(Config, "ALLOWED_COMMANDS", set())
+        if command not in allowed:
+            return create_error_response(
+                ErrorCode.SECURITY_VIOLATION,
+                f"Command '{command}' is not whitelisted. Whitelisted commands: {sorted(list(allowed))}",
+                {"command": command},
+            )
+
+        full_cmd = [command] + arguments
+        logger.info("Executing command: %s", " ".join(full_cmd))
+
+        start_time = time.perf_counter()
+        try:
+            # Run whitelisted command securely in the project root folder
+            res = subprocess.run(
+                full_cmd,
+                cwd=Config.PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30, # Safe timeout
+            )
+            elapsed = (time.perf_counter() - start_time) * 1000
+
+            return create_success_response(
+                {
+                    "command": " ".join(full_cmd),
+                    "exit_code": res.returncode,
+                    "stdout": res.stdout,
+                    "stderr": res.stderr,
+                    "execution_time_ms": round(elapsed, 1),
+                }
+            )
+        except subprocess.TimeoutExpired:
+            return create_error_response(
+                ErrorCode.TIMEOUT_ERROR,
+                f"Command execution timed out after 30 seconds: {' '.join(full_cmd)}",
+                {"command": command},
+            )
+        except Exception as exc:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                f"Failed to execute command: {exc}",
+                {"command": command},
+            )
 
     # ------------------------------------------------------------------
     # Summary
@@ -1000,6 +1323,8 @@ def register_file_tools(mcp) -> List[str]:
         "get_file_info",
         "analyze_file",
         "set_project_root",
+        "modify_file",
+        "execute_command",
     ]
     logger.info("Registered %d file-operation tools", len(tool_names))
     return tool_names

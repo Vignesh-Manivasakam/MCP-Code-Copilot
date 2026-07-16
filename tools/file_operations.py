@@ -1790,6 +1790,208 @@ def register_file_tools(mcp) -> List[str]:
             )
 
     # ------------------------------------------------------------------
+    # Tool 18 – search_codebase
+    # ------------------------------------------------------------------
+    @mcp.tool()
+    def search_codebase(
+        query: str,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        """Search the codebase for keywords or prefix terms using local SQLite FTS5 index.
+        
+        USE THIS WHEN:
+        - You need to search for variables, class names, or text patterns across all files.
+        - You want fast full-text search without scanning directories file-by-file.
+        """
+        from middleware.gating import gating_registry
+        gating_registry.transition("search_codebase")
+        
+        from services.search_index import search_code
+        try:
+            results = search_code(Config.PROJECT_ROOT, query, limit)
+            return create_success_response({
+                "query": query,
+                "results": results,
+                "count": len(results)
+            })
+        except Exception as e:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                f"Failed to search codebase index: {e}",
+                {"query": query}
+            )
+
+    # ------------------------------------------------------------------
+    # Tool 19 – lsp_find_definition
+    # ------------------------------------------------------------------
+    @mcp.tool()
+    def lsp_find_definition(
+        file_path: str,
+        line: int,
+        character: int,
+        language: str = "python",
+    ) -> Dict[str, Any]:
+        """Navigate to the definition of a symbol at the specified line and character.
+        
+        USE THIS WHEN:
+        - You want to find where a function, class, or variable is defined.
+        """
+        from middleware.gating import gating_registry
+        gating_registry.transition("lsp_find_definition")
+        
+        valid, resolved, err = SecurityValidator.validate_path(file_path)
+        if not valid:
+            return create_error_response(ErrorCode.SECURITY_VIOLATION, err, {"file_path": file_path})
+            
+        from services.lsp_client import LSPClient
+        client = LSPClient(Config.PROJECT_ROOT, language)
+        if not client.start():
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                f"LSP server not available for language: {language}",
+                {"file_path": file_path}
+            )
+            
+        try:
+            results = client.find_definition(file_path, line, character)
+            return create_success_response({
+                "file_path": file_path,
+                "line": line,
+                "character": character,
+                "results": results
+            })
+        finally:
+            client.stop()
+
+    # ------------------------------------------------------------------
+    # Tool 20 – lsp_find_references
+    # ------------------------------------------------------------------
+    @mcp.tool()
+    def lsp_find_references(
+        file_path: str,
+        line: int,
+        character: int,
+        language: str = "python",
+    ) -> Dict[str, Any]:
+        """Find all references (usages) of a symbol across the project.
+        
+        USE THIS WHEN:
+        - You want to find where a variable, function, or class is used or called.
+        """
+        from middleware.gating import gating_registry
+        gating_registry.transition("lsp_find_references")
+        
+        valid, resolved, err = SecurityValidator.validate_path(file_path)
+        if not valid:
+            return create_error_response(ErrorCode.SECURITY_VIOLATION, err, {"file_path": file_path})
+            
+        from services.lsp_client import LSPClient
+        client = LSPClient(Config.PROJECT_ROOT, language)
+        if not client.start():
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                f"LSP server not available for language: {language}",
+                {"file_path": file_path}
+            )
+            
+        try:
+            results = client.find_references(file_path, line, character)
+            return create_success_response({
+                "file_path": file_path,
+                "line": line,
+                "character": character,
+                "results": results
+            })
+        finally:
+            client.stop()
+
+    # ------------------------------------------------------------------
+    # Tool 21 – get_tool_schema
+    # ------------------------------------------------------------------
+    @mcp.tool()
+    def get_tool_schema(tool_name: str) -> Dict[str, Any]:
+        """Retrieve the complete argument blueprints (JSON schema) for a lazy-loaded tool.
+        
+        USE THIS WHEN:
+        - You want to invoke a tool (like modify_file or execute_command) but its schema is lazy-loaded (hidden).
+        """
+        from middleware.gating import gating_registry
+        gating_registry.transition("get_tool_schema")
+        
+        schema = gating_registry.original_schemas.get(tool_name)
+        if not schema:
+            return create_error_response(
+                ErrorCode.INVALID_INPUT,
+                f"Tool '{tool_name}' schema not found or not registered as lazy.",
+                {"tool_name": tool_name}
+            )
+        return create_success_response({
+            "tool_name": tool_name,
+            "parameters": schema
+        })
+
+    # ------------------------------------------------------------------
+    # Tool 22 – git_checkpoint
+    # ------------------------------------------------------------------
+    @mcp.tool()
+    def git_checkpoint(message: str) -> Dict[str, Any]:
+        """Create a local Git checkpoint commit of the current workspace state.
+        
+        USE THIS WHEN:
+        - You are about to make significant edits and want to save a rollback checkpoint.
+        """
+        from middleware.gating import gating_registry
+        gating_registry.transition("git_checkpoint")
+        
+        try:
+            # Check if repo is git repository
+            subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=Config.PROJECT_ROOT, capture_output=True, check=True)
+            # Stage all changes
+            subprocess.run(["git", "add", "-A"], cwd=Config.PROJECT_ROOT, check=True)
+            # Commit
+            res = subprocess.run(["git", "commit", "-m", f"checkpoint: {message}"], cwd=Config.PROJECT_ROOT, capture_output=True, text=True)
+            return create_success_response({
+                "status": "checkpoint created",
+                "message": message,
+                "stdout": res.stdout
+            })
+        except Exception as e:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                f"Failed to create Git checkpoint: {e}",
+                {}
+            )
+
+    # ------------------------------------------------------------------
+    # Tool 23 – git_rollback
+    # ------------------------------------------------------------------
+    @mcp.tool()
+    def git_rollback() -> Dict[str, Any]:
+        """Roll back the workspace to the last Git checkpoint.
+        
+        USE THIS WHEN:
+        - Code modifications or test executions broke the codebase and you want to start over.
+        """
+        from middleware.gating import gating_registry
+        gating_registry.transition("git_rollback")
+        
+        try:
+            subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=Config.PROJECT_ROOT, capture_output=True, check=True)
+            # Hard reset to HEAD
+            subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=Config.PROJECT_ROOT, check=True)
+            # Clean untracked files
+            subprocess.run(["git", "clean", "-fd"], cwd=Config.PROJECT_ROOT, check=True)
+            return create_success_response({
+                "status": "rolled back successfully"
+            })
+        except Exception as e:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                f"Failed to roll back: {e}",
+                {}
+            )
+
+    # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
 
@@ -1811,6 +2013,12 @@ def register_file_tools(mcp) -> List[str]:
         "get_diagnostics",
         "execute_command",
         "set_project_root",
+        "search_codebase",
+        "lsp_find_definition",
+        "lsp_find_references",
+        "get_tool_schema",
+        "git_checkpoint",
+        "git_rollback",
     ]
     logger.info("Registered %d file-operation tools", len(tool_names))
     return tool_names

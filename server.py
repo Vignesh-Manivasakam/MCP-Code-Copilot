@@ -49,6 +49,9 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(Config.SERVER_NAME)
 
+from middleware.gating import setup_gating_middleware
+setup_gating_middleware(mcp)
+
 # ---------------------------------------------------------------------------
 # Custom HTTP routes
 # ---------------------------------------------------------------------------

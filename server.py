@@ -177,7 +177,7 @@ def initialize_server(project_root: Optional[str] = None) -> None:
 # ---------------------------------------------------------------------------
 
 
-if __name__ == "__main__":
+def main():
     import uvicorn  # noqa: PLC0415
 
     parser = argparse.ArgumentParser(
@@ -234,3 +234,7 @@ if __name__ == "__main__":
         uvicorn.run(http_app, host=args.host, port=args.port)
     except KeyboardInterrupt:
         print("\n✅ Server stopped.")
+
+
+if __name__ == "__main__":
+    main()

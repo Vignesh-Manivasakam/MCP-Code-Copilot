@@ -39,17 +39,24 @@ graph TD
 
 ## 🛠️ Tool Registry
 
-The server registers 10 high-performance tools:
-1. `read_file`: Reads files safely with auto-encoding detection via `chardet`.
-2. `write_file`: Overwrites files (with optional automatic `.bak` backups).
-3. `create_file`: Initializes a new file.
-4. `list_files`: Scans directories using glob filters.
-5. `get_file_structure`: Generates a nested directory tree with configurable depth.
-6. `search_in_files`: Runs regex/text searches.
-7. `find_function`: Extracts function and method definitions.
-8. `find_references`: Scans for whole-word occurrences of a symbol.
-9. `get_file_info`: Retrieves size, encoding, and syntax language.
-10. `analyze_file`: Calculates code metrics (lines, classes, functions, imports).
+The server registers 17 high-performance tools:
+1. `read_file`: Reads files safely (supports start_line/end_line line ranges for token optimization).
+2. `batch_read_files`: Reads up to 10 files in a single tool call to minimize context round-trips.
+3. `write_file`: Creates or overwrites files (guides AI to create with content directly).
+4. `create_file`: Lightweight placeholder creator (creates empty files only).
+5. `modify_file`: Surgical edit tool replacing specific text blocks (supports quote preservation, bounds, and read-staleness checks).
+6. `undo_edit`: Single-level undo reverting the last edit made to a file.
+7. `list_files`: Lists directory contents with filters.
+8. `get_file_structure`: Generates a nested directory tree of the project.
+9. `search_in_files`: Runs regex/text searches.
+10. `grep_search`: Ripgrep-like search returning matches with surrounding context lines.
+11. `find_function`: Extracts function and class definitions.
+12. `find_references`: Scans for symbol references across the project.
+13. `get_file_info`: Retrieves size, encoding, language, and modification time.
+14. `analyze_file`: Calculates code structure metrics and complexity.
+15. `get_diagnostics`: Lightweight syntax validation for Python, JSON, and JS.
+16. `execute_command`: Secure, whitelisted command executor inside the project sandbox (pytest, git, python, npm).
+17. `set_project_root`: Dynamically switches the active project root directory at runtime.
 
 ---
 
@@ -78,20 +85,25 @@ MCP-Code-Copilot/
 
 ## 🚀 Installation & Quick Start
 
-### 1. Install Dependencies
+### 1. Install using Pip (CLI Mode)
+You can install the server in editable mode so it registers a global command line entry point `mcp-code-copilot`:
 ```bash
-pip install -r requirements.txt
+# Run inside the repository directory:
+pip install -e .
 ```
 
 ### 2. Launch the Server
-Start the server and pass the target sandbox folder path:
+Start the server and specify the target sandbox folder path:
 ```bash
+# Using the CLI wrapper directly:
+mcp-code-copilot /path/to/your/sandbox/project --port 8000
+
+# Or using python directly:
 python server.py /path/to/your/sandbox/project --port 8000
 ```
-Upon startup, the server console will display:
 ```text
 ============================================================
-🚀 Code Copilot MCP Server  v1.0.0
+🚀 Code Copilot MCP Server  v2.0.0
 ============================================================
   Project : my-project
   MCP     : http://127.0.0.1:8000/mcp

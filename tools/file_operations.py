@@ -130,15 +130,25 @@ def register_file_tools(mcp) -> List[str]:
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def read_file(file_path: str, max_lines: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Read the contents of a file from the project.
+    def read_file(
+        file_path: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        max_lines: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Read a file from the project. Supports partial reads for token efficiency.
+
+        USE THIS WHEN:
+        - You need to see file content before editing
+        - You know the approximate line range of interest (use start_line/end_line)
+        TOKEN SAVING: Use start_line and end_line to read only the lines you need.
+        Reading 30 lines instead of 2000 saves massive tokens.
 
         Args:
-            file_path: Relative path to the file from the project root
-                       (e.g. "src/main.py").
-            max_lines: When set, only the first *max_lines* lines are returned
-                       and ``truncated`` will be ``True`` in the response.
+            file_path:  Relative path to the file (e.g. "src/main.py").
+            start_line: 1-based start line (inclusive). Omit to start from line 1.
+            end_line:   1-based end line (inclusive). Omit to read to end of file.
+            max_lines:  Maximum lines to return (applied after line range filtering).
         """
         is_valid, resolved, error_msg = SecurityValidator.validate_path(file_path)
         if not is_valid:
@@ -194,21 +204,134 @@ def register_file_tools(mcp) -> List[str]:
         lines = content.splitlines()
         total_lines = len(lines)
         truncated = False
+        returned_start = 1
+        returned_end = total_lines
 
-        if max_lines is not None and max_lines < total_lines:
+        # Apply line range filtering
+        if start_line is not None or end_line is not None:
+            s = (start_line or 1) - 1  # Convert to 0-based
+            e = end_line or total_lines
+            if s < 0:
+                s = 0
+            if e > total_lines:
+                e = total_lines
+            if s >= e:
+                return create_error_response(
+                    ErrorCode.INVALID_INPUT,
+                    f"Invalid line range: start_line={start_line}, end_line={end_line} (file has {total_lines} lines)",
+                    {"file_path": file_path},
+                )
+            lines = lines[s:e]
+            content = "\n".join(lines)
+            truncated = True
+            returned_start = s + 1
+            returned_end = e
+
+        # Apply max_lines limit
+        if max_lines is not None and max_lines < len(lines):
             content = "\n".join(lines[:max_lines])
             truncated = True
+            returned_end = returned_start + max_lines - 1
 
         return create_success_response(
             {
                 "file_path": file_path,
                 "content": content,
                 "encoding": encoding,
-                "lines": total_lines,
+                "total_lines": total_lines,
+                "returned_lines": len(content.splitlines()),
+                "returned_range": f"{returned_start}-{returned_end}",
                 "size": file_size,
                 "size_human": get_file_size_human(file_size),
                 "size_warning": should_warn_file_size(file_size),
                 "truncated": truncated,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Tool 1B – batch_read_files
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def batch_read_files(
+        file_paths: List[str],
+        max_lines_per_file: Optional[int] = 200,
+    ) -> Dict[str, Any]:
+        """Read multiple files in a single tool call. Returns content for all files.
+
+        USE THIS WHEN: You need context from several related files at once
+        (e.g., a module and its tests, or a function and its callers).
+        TOKEN SAVING: Reading 5 files in one call instead of 5 separate read_file calls
+        reduces tool call overhead significantly.
+
+        Args:
+            file_paths:         List of relative paths to read (max 10 files).
+            max_lines_per_file: Maximum lines per file (default: 200). Set to None for full content.
+        """
+        if not file_paths:
+            return create_error_response(
+                ErrorCode.INVALID_INPUT, "No file paths provided", {}
+            )
+
+        if len(file_paths) > Config.MAX_BATCH_READ_FILES:
+            return create_error_response(
+                ErrorCode.INVALID_INPUT,
+                f"Too many files: {len(file_paths)} (max {Config.MAX_BATCH_READ_FILES})",
+                {"count": len(file_paths)},
+            )
+
+        results = {}
+        errors = {}
+
+        for fp in file_paths:
+            is_valid, resolved, error_msg = SecurityValidator.validate_path(fp)
+            if not is_valid:
+                errors[fp] = error_msg
+                continue
+
+            is_readable, read_err = SecurityValidator.check_file_readable(resolved)
+            if not is_readable:
+                errors[fp] = read_err
+                continue
+
+            if SecurityValidator.is_binary_file(resolved):
+                errors[fp] = "Binary file — cannot read as text"
+                continue
+
+            try:
+                content, encoding = read_file_with_encoding(resolved)
+            except Exception as exc:
+                errors[fp] = f"Read error: {exc}"
+                continue
+
+            lines = content.splitlines()
+            truncated = False
+            if max_lines_per_file is not None and len(lines) > max_lines_per_file:
+                content = "\n".join(lines[:max_lines_per_file])
+                truncated = True
+
+            results[fp] = {
+                "content": content,
+                "encoding": encoding,
+                "total_lines": len(lines),
+                "truncated": truncated,
+            }
+
+            # Track in registry
+            try:
+                Config.FILE_READ_REGISTRY[resolved] = {
+                    "content": "\n".join(lines),
+                    "timestamp": resolved.stat().st_mtime,
+                }
+            except OSError:
+                pass
+
+        return create_success_response(
+            {
+                "files": results,
+                "errors": errors,
+                "files_read": len(results),
+                "files_failed": len(errors),
             }
         )
 
@@ -220,14 +343,19 @@ def register_file_tools(mcp) -> List[str]:
     def write_file(
         file_path: str, content: str, create_backup: bool = False
     ) -> Dict[str, Any]:
-        """
-        Write or overwrite a file with *content*.
+        """Create a new file with content, or completely overwrite an existing file.
+
+        USE THIS WHEN:
+        - Creating a NEW file with content (replaces create_file + write_file pattern)
+        - Completely replacing ALL content in an existing file
+        DO NOT USE WHEN:
+        - Making small edits to an existing file — use modify_file instead (saves tokens)
+        TOKEN SAVING: Call this ONCE to create a file with content. Never call create_file first.
 
         Args:
-            file_path:     Relative path to the target file.
-            content:       UTF-8 text to write.
-            create_backup: When ``True`` and the file already exists, a ``.bak``
-                           copy is created before overwriting.
+            file_path:     Relative path to the target file (e.g. "src/app.py").
+            content:       Complete UTF-8 text content for the file.
+            create_backup: When True and file exists, creates a .bak backup before overwriting.
         """
         is_valid, resolved, error_msg = SecurityValidator.validate_path(file_path)
         if not is_valid:
@@ -256,7 +384,17 @@ def register_file_tools(mcp) -> List[str]:
         backup_created = False
         old_line_count = 0
 
+        # Save pre-write state for undo (only if file existed)
         if file_existed:
+            try:
+                old_content, old_enc = read_file_with_encoding(resolved)
+                Config.EDIT_HISTORY[resolved] = {
+                    "content": old_content,
+                    "encoding": old_enc,
+                }
+            except Exception:
+                pass
+
             if create_backup:
                 backup_path = resolved.with_suffix(resolved.suffix + ".bak")
                 try:
@@ -297,21 +435,26 @@ def register_file_tools(mcp) -> List[str]:
         )
 
     # ------------------------------------------------------------------
-    # Tool 3 – create_file
+    # ------------------------------------------------------------------
+    # Tool 3 – create_file (lightweight — creates empty file only)
     # ------------------------------------------------------------------
 
     @mcp.tool()
     def create_file(
-        file_path: str, content: str = "", overwrite: bool = False
+        file_path: str, overwrite: bool = False
     ) -> Dict[str, Any]:
-        """
-        Create a new file, optionally pre-populated with *content*.
+        """Create a new EMPTY file (and parent directories if needed).
+
+        IMPORTANT: This tool creates an EMPTY file only. It does NOT accept content.
+        After creating the file, use write_file to add content to it.
+
+        USE THIS WHEN: You need to create a new empty file or ensure a file exists.
+        DO NOT USE THIS WHEN: You want to create a file WITH content — use write_file directly instead.
+        TOKEN SAVING: To create a file with content, call write_file ONCE (not create_file + write_file).
 
         Args:
-            file_path: Relative path for the new file.
-            content:   Initial file content (default: empty).
-            overwrite: When ``False`` (default) the tool returns an error if the
-                       file already exists.  Set to ``True`` to allow overwriting.
+            file_path: Relative path for the new file (e.g. "src/utils/helpers.py").
+            overwrite: When False (default), returns error if file already exists.
         """
         is_valid, resolved, error_msg = SecurityValidator.validate_path(file_path)
         if not is_valid:
@@ -322,7 +465,7 @@ def register_file_tools(mcp) -> List[str]:
         if resolved.exists() and not overwrite:
             return create_error_response(
                 ErrorCode.FILE_EXISTS,
-                f"File already exists: {file_path}",
+                f"File already exists: {file_path}. Use write_file to update it, or set overwrite=True.",
                 {"file_path": file_path},
             )
 
@@ -336,8 +479,7 @@ def register_file_tools(mcp) -> List[str]:
             )
 
         try:
-            with open(resolved, "w", encoding="utf-8") as fh:
-                fh.write(content)
+            resolved.touch(exist_ok=overwrite)
         except OSError as exc:
             return create_error_response(
                 ErrorCode.WRITE_ERROR,
@@ -345,13 +487,13 @@ def register_file_tools(mcp) -> List[str]:
                 {"file_path": file_path},
             )
 
-        bytes_written = len(content.encode("utf-8"))
         return create_success_response(
             {
                 "file_path": file_path,
                 "action": "created",
-                "bytes_written": bytes_written,
-                "lines": len(content.splitlines()),
+                "bytes_written": 0,
+                "lines": 0,
+                "hint": "File created empty. Use write_file to add content.",
             }
         )
 
@@ -363,8 +505,11 @@ def register_file_tools(mcp) -> List[str]:
     def list_files(
         directory: str = ".", pattern: str = "*", recursive: bool = False
     ) -> Dict[str, Any]:
-        """
-        List files / directories inside *directory*.
+        """List files and directories inside a directory.
+
+        USE THIS WHEN: Exploring project structure, finding files in a specific directory.
+        DO NOT USE WHEN: Searching for files by name pattern across the project — use glob_search instead.
+        DO NOT USE WHEN: Searching for content inside files — use grep_search instead.
 
         Args:
             directory: Path relative to project root (default: project root).
@@ -444,8 +589,10 @@ def register_file_tools(mcp) -> List[str]:
     def get_file_structure(
         max_depth: int = 5, include_hidden: bool = False
     ) -> Dict[str, Any]:
-        """
-        Return a nested tree of the entire project.
+        """Return a nested tree of the entire project.
+
+        USE THIS WHEN: Getting an overview of the entire project layout.
+        DO NOT USE WHEN: Looking for a specific file — use glob_search or list_files instead.
 
         Args:
             max_depth:      Maximum directory depth to traverse (default: 5).
@@ -485,8 +632,10 @@ def register_file_tools(mcp) -> List[str]:
         case_sensitive: bool = False,
         max_results: int = 100,
     ) -> Dict[str, Any]:
-        """
-        Search for *query* text across all matching files in the project.
+        """Search for *query* text across all matching files in the project.
+
+        USE THIS WHEN: Finding where a function is called, locating imports, finding error messages.
+        DO NOT USE WHEN: Finding files by name — use list_files with a pattern instead.
 
         Args:
             query:          Text to search for.
@@ -579,6 +728,120 @@ def register_file_tools(mcp) -> List[str]:
         )
 
     # ------------------------------------------------------------------
+    # Tool – grep_search (advanced content search)
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def grep_search(
+        pattern: str,
+        path: str = ".",
+        include: Optional[str] = None,
+        exclude: Optional[str] = None,
+        is_regex: bool = True,
+        case_sensitive: bool = True,
+        max_results: int = 50,
+        context_lines: int = 2,
+    ) -> Dict[str, Any]:
+        """Search file contents for a text or regex pattern. Returns matches with surrounding context.
+
+        USE THIS WHEN: Finding function callers, locating imports, searching for error messages,
+        finding TODO/FIXME comments, locating configuration values.
+        DO NOT USE WHEN: Finding files by name — use list_files or find_function instead.
+        TOKEN SAVING: context_lines shows surrounding code so you don't need a follow-up read_file call.
+
+        Args:
+            pattern:        Text or regex pattern to search for.
+            path:           Directory to search in, relative to project root (default: entire project).
+            include:        Glob filter for file names (e.g. "*.py", "*.ts"). Only searches matching files.
+            exclude:        Glob filter to exclude files (e.g. "*.test.*", "*.min.js").
+            is_regex:       If True (default), treat pattern as regex. If False, treat as literal text.
+            case_sensitive: If True (default), search is case-sensitive.
+            max_results:    Maximum number of matches to return (default: 50).
+            context_lines:  Number of lines to show before and after each match (default: 2).
+        """
+        is_valid, resolved_dir, error_msg = SecurityValidator.validate_path(path)
+        if not is_valid:
+            return create_error_response(
+                ErrorCode.SECURITY_VIOLATION, error_msg, {"path": path}
+            )
+
+        if not resolved_dir.is_dir():
+            return create_error_response(
+                ErrorCode.DIRECTORY_NOT_FOUND,
+                f"Path is not a directory: {path}",
+                {"path": path},
+            )
+
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            if is_regex:
+                compiled = re.compile(pattern, flags)
+            else:
+                compiled = re.compile(re.escape(pattern), flags)
+        except re.error as exc:
+            return create_error_response(
+                ErrorCode.INVALID_PATTERN,
+                f"Invalid regex pattern: {exc}",
+                {"pattern": pattern},
+            )
+
+        matches = []
+        files_searched = 0
+
+        for file_path in walk_safe_paths(resolved_dir, include or "*", recursive=True):
+            if not file_path.is_file():
+                continue
+
+            # Apply exclude filter
+            if exclude and file_path.match(exclude):
+                continue
+
+            if SecurityValidator.is_binary_file(file_path):
+                continue
+
+            files_searched += 1
+            try:
+                content, _ = read_file_with_encoding(file_path)
+            except Exception:
+                continue
+
+            lines = content.splitlines()
+            rel_path = file_path.relative_to(Config.PROJECT_ROOT).as_posix()
+
+            for i, line in enumerate(lines):
+                if compiled.search(line):
+                    # Get context lines
+                    ctx_start = max(0, i - context_lines)
+                    ctx_end = min(len(lines), i + context_lines + 1)
+                    context_block = "\n".join(
+                        f"{'>' if j == i else ' '} {j + 1}: {lines[j]}"
+                        for j in range(ctx_start, ctx_end)
+                    )
+
+                    matches.append({
+                        "file": rel_path,
+                        "line": i + 1,
+                        "content": line.strip(),
+                        "context": context_block,
+                    })
+
+                    if len(matches) >= max_results:
+                        break
+
+            if len(matches) >= max_results:
+                break
+
+        return create_success_response(
+            {
+                "pattern": pattern,
+                "total_matches": len(matches),
+                "files_searched": files_searched,
+                "truncated": len(matches) >= max_results,
+                "results": matches,
+            }
+        )
+
+    # ------------------------------------------------------------------
     # Tool 7 – find_function
     # ------------------------------------------------------------------
 
@@ -586,10 +849,10 @@ def register_file_tools(mcp) -> List[str]:
     def find_function(
         function_name: str, file_pattern: str = "*.py"
     ) -> Dict[str, Any]:
-        """
-        Locate function / method definitions matching *function_name*.
+        """Locate function / method definitions matching *function_name*.
 
-        Uses regex-based pattern matching – adequate for Phase 1.
+        USE THIS WHEN: Locating where a specific function or class is defined.
+        DO NOT USE WHEN: Finding where a function is called/used — use search_in_files instead.
 
         Args:
             function_name: Exact name of the function to find.
@@ -730,8 +993,10 @@ def register_file_tools(mcp) -> List[str]:
 
     @mcp.tool()
     def get_file_info(file_path: str) -> Dict[str, Any]:
-        """
-        Return detailed metadata about a file or directory.
+        """Return detailed metadata about a file or directory.
+
+        USE THIS WHEN: Checking if a file exists, how large it is, or what language it is.
+        DO NOT USE WHEN: You need to read the file content — use read_file instead.
 
         Args:
             file_path: Relative path to the file to inspect.
@@ -790,11 +1055,10 @@ def register_file_tools(mcp) -> List[str]:
 
     @mcp.tool()
     def analyze_file(file_path: str) -> Dict[str, Any]:
-        """
-        Analyse a source-code file and return metrics.
+        """Analyse a source-code file and return metrics.
 
-        Metrics include line counts by type, detected functions/classes/imports,
-        and a simple complexity rating (low / medium / high).
+        USE THIS WHEN: Understanding the complexity and structure of a file before editing.
+        DO NOT USE WHEN: You just need to read the content — use read_file instead.
 
         Args:
             file_path: Relative path to the file to analyse.
@@ -926,6 +1190,122 @@ def register_file_tools(mcp) -> List[str]:
         )
 
     # ------------------------------------------------------------------
+    # Tool – get_diagnostics (lightweight syntax checking)
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def get_diagnostics(file_path: str) -> Dict[str, Any]:
+        """Check a file for syntax errors without running it.
+
+        USE THIS WHEN: After making edits with modify_file or write_file, verify the file is valid.
+        Supports: Python (.py), JSON (.json), JavaScript (.js — requires node).
+        DO NOT USE WHEN: You want to run tests — use execute_command with pytest instead.
+
+        Args:
+            file_path: Relative path to the file to check.
+        """
+        import ast
+        import json as json_module
+
+        is_valid, resolved, error_msg = SecurityValidator.validate_path(file_path)
+        if not is_valid:
+            return create_error_response(
+                ErrorCode.SECURITY_VIOLATION, error_msg, {"file_path": file_path}
+            )
+
+        is_readable, read_err = SecurityValidator.check_file_readable(resolved)
+        if not is_readable:
+            return create_error_response(
+                ErrorCode.FILE_NOT_FOUND if not resolved.exists() else ErrorCode.PERMISSION_DENIED,
+                read_err,
+                {"file_path": file_path},
+            )
+
+        try:
+            content, _ = read_file_with_encoding(resolved)
+        except Exception as exc:
+            return create_error_response(
+                ErrorCode.READ_ERROR, f"Failed to read: {exc}", {"file_path": file_path}
+            )
+
+        ext = resolved.suffix.lower()
+        diagnostics = []
+
+        if ext == ".py":
+            try:
+                ast.parse(content, filename=file_path)
+            except SyntaxError as e:
+                diagnostics.append({
+                    "severity": "error",
+                    "line": e.lineno,
+                    "column": e.offset,
+                    "message": str(e.msg),
+                })
+
+            # Also check with compile for additional errors
+            try:
+                compile(content, file_path, "exec")
+            except SyntaxError as e:
+                if not diagnostics:  # Avoid duplicate
+                    diagnostics.append({
+                        "severity": "error",
+                        "line": e.lineno,
+                        "column": e.offset,
+                        "message": str(e.msg),
+                    })
+
+        elif ext == ".json":
+            try:
+                json_module.loads(content)
+            except json_module.JSONDecodeError as e:
+                diagnostics.append({
+                    "severity": "error",
+                    "line": e.lineno,
+                    "column": e.colno,
+                    "message": str(e.msg),
+                })
+
+        elif ext in (".js", ".ts", ".jsx", ".tsx"):
+            import subprocess as _sp
+            try:
+                res = _sp.run(
+                    ["node", "--check", str(resolved)],
+                    capture_output=True, text=True, timeout=10,
+                    cwd=Config.PROJECT_ROOT,
+                )
+                if res.returncode != 0:
+                    diagnostics.append({
+                        "severity": "error",
+                        "line": None,
+                        "column": None,
+                        "message": res.stderr.strip(),
+                    })
+            except (FileNotFoundError, _sp.TimeoutExpired):
+                diagnostics.append({
+                    "severity": "warning",
+                    "line": None,
+                    "column": None,
+                    "message": "Node.js not available for JS/TS syntax checking.",
+                })
+        else:
+            return create_success_response({
+                "file_path": file_path,
+                "language": ext,
+                "status": "unsupported",
+                "message": f"No syntax checker available for {ext} files.",
+                "diagnostics": [],
+            })
+
+        status = "error" if diagnostics else "ok"
+        return create_success_response({
+            "file_path": file_path,
+            "language": ext,
+            "status": status,
+            "diagnostics": diagnostics,
+            "total_errors": len(diagnostics),
+        })
+
+    # ------------------------------------------------------------------
     # Tool 11 – set_project_root
     # ------------------------------------------------------------------
 
@@ -1008,18 +1388,28 @@ def register_file_tools(mcp) -> List[str]:
         allow_multiple: bool = False,
         create_backup: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Modify a file by replacing a specific unique target_content block with replacement_content.
-        Optimized for making small changes without rewriting the entire file.
+        """Make a surgical edit to an existing file by replacing a specific block of text.
+
+        USE THIS WHEN:
+        - Changing specific lines or blocks in an existing file
+        - Fixing bugs, updating function logic, adding imports to existing files
+        - Any edit where you are NOT replacing the entire file content
+        DO NOT USE WHEN:
+        - Creating a brand new file — use write_file instead
+        - Replacing ALL content of a file — use write_file instead
+        TOKEN SAVING: Send ONLY the exact target block and its replacement.
+        Do NOT send the entire file content. This saves significant tokens.
 
         Args:
             file_path:           Relative path to the target file.
-            target_content:      The exact block of text to find and replace.
-            replacement_content: The new block of text to replace it with.
-            start_line:          Optional 1-based start line to restrict the search area.
-            end_line:            Optional 1-based end line to restrict the search area.
-            allow_multiple:      If True, replaces all occurrences. If False (default), fails if target matches more than once.
-            create_backup:       When True, a `.bak` backup copy of the file is created before modifying.
+            target_content:      The exact text block to find. Must match the file content exactly.
+                                 Include enough surrounding context to make the match unique.
+            replacement_content: The new text to replace the target with.
+            start_line:          Optional 1-based start line to restrict search area (improves accuracy).
+            end_line:            Optional 1-based end line to restrict search area.
+            allow_multiple:      If True, replaces ALL occurrences. If False (default), fails if
+                                 target matches more than once (safety guard).
+            create_backup:       When True, creates a .bak backup before modifying.
         """
         if not target_content:
             return create_error_response(
@@ -1199,6 +1589,12 @@ def register_file_tools(mcp) -> List[str]:
         # Reconstruct updated content
         new_content = "".join(lines[:start_idx]) + new_search_block + "".join(lines[end_idx:])
 
+        # Save pre-edit state for undo
+        Config.EDIT_HISTORY[resolved] = {
+            "content": content,
+            "encoding": encoding,
+        }
+
         # Create backup if requested
         backup_created = False
         if create_backup:
@@ -1239,20 +1635,88 @@ def register_file_tools(mcp) -> List[str]:
         )
 
     # ------------------------------------------------------------------
+    # Tool – undo_edit
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def undo_edit(file_path: str) -> Dict[str, Any]:
+        """Revert the last edit made to a file, restoring its previous content.
+
+        USE THIS WHEN: A modify_file or write_file introduced a bug and you need to revert.
+        Only reverts the MOST RECENT edit (single-level undo).
+        After undo, you can read_file to see the restored content.
+
+        Args:
+            file_path: Relative path to the file to revert.
+        """
+        is_valid, resolved, error_msg = SecurityValidator.validate_path(file_path)
+        if not is_valid:
+            return create_error_response(
+                ErrorCode.SECURITY_VIOLATION, error_msg, {"file_path": file_path}
+            )
+
+        history = Config.EDIT_HISTORY.get(resolved)
+        if not history:
+            return create_error_response(
+                ErrorCode.INVALID_INPUT,
+                f"No edit history found for {file_path}. Cannot undo.",
+                {"file_path": file_path},
+            )
+
+        try:
+            with open(resolved, "w", encoding=history["encoding"]) as fh:
+                fh.write(history["content"])
+        except OSError as exc:
+            return create_error_response(
+                ErrorCode.WRITE_ERROR,
+                f"Failed to restore file: {exc}",
+                {"file_path": file_path},
+            )
+
+        # Update read registry with restored content
+        try:
+            Config.FILE_READ_REGISTRY[resolved] = {
+                "content": history["content"],
+                "timestamp": resolved.stat().st_mtime,
+            }
+        except OSError:
+            pass
+
+        # Remove from history (single-level undo)
+        del Config.EDIT_HISTORY[resolved]
+
+        restored_lines = len(history["content"].splitlines())
+        return create_success_response(
+            {
+                "file_path": file_path,
+                "action": "reverted",
+                "restored_lines": restored_lines,
+            }
+        )
+
+    # ------------------------------------------------------------------
     # Tool 12 – execute_command
     # ------------------------------------------------------------------
 
     @mcp.tool()
     def execute_command(
-        command: str, arguments: List[str] = []
+        command: str,
+        arguments: List[str] = [],
+        working_directory: Optional[str] = None,
+        timeout: int = 30,
     ) -> Dict[str, Any]:
-        """
-        Execute a whitelisted development command (e.g. pytest, python, npm run test) in the project root.
-        Highly secure: commands are sandboxed to the project directory and whitelisted to prevent system exploitation.
+        """Execute a whitelisted development command in the project sandbox.
+
+        USE THIS WHEN: Running tests (pytest), linting (ruff, flake8), git operations,
+        building projects (npm run build), or any development task.
+        DO NOT USE WHEN: Reading or writing files — use file tools instead.
+        SECURITY: Only whitelisted commands are allowed. Commands run sandboxed in the project directory.
 
         Args:
-            command:   The command to execute (e.g., "pytest", "python", "npm", "git").
-            arguments: List of arguments to pass to the command.
+            command:           The executable to run (must be whitelisted: python, pytest, npm, git, ruff, etc.).
+            arguments:         List of arguments for the command.
+            working_directory: Subdirectory within project to run in (relative path, default: project root).
+            timeout:           Max execution time in seconds (default: 30, max: 300).
         """
         import subprocess
 
@@ -1273,15 +1737,33 @@ def register_file_tools(mcp) -> List[str]:
         full_cmd = [command] + arguments
         logger.info("Executing command: %s", " ".join(full_cmd))
 
+        # Determine working directory
+        cwd = Config.PROJECT_ROOT
+        if working_directory:
+            wd_valid, wd_resolved, wd_err = SecurityValidator.validate_path(working_directory)
+            if not wd_valid:
+                return create_error_response(
+                    ErrorCode.SECURITY_VIOLATION, wd_err, {"working_directory": working_directory}
+                )
+            if not wd_resolved.is_dir():
+                return create_error_response(
+                    ErrorCode.DIRECTORY_NOT_FOUND,
+                    f"Working directory not found: {working_directory}",
+                    {"working_directory": working_directory},
+                )
+            cwd = wd_resolved
+
+        # Clamp timeout
+        actual_timeout = min(max(timeout, 5), Config.COMMAND_TIMEOUT_MAX)
+
         start_time = time.perf_counter()
         try:
-            # Run whitelisted command securely in the project root folder
             res = subprocess.run(
                 full_cmd,
-                cwd=Config.PROJECT_ROOT,
+                cwd=cwd,
                 capture_output=True,
                 text=True,
-                timeout=30, # Safe timeout
+                timeout=actual_timeout,
             )
             elapsed = (time.perf_counter() - start_time) * 1000
 
@@ -1297,7 +1779,7 @@ def register_file_tools(mcp) -> List[str]:
         except subprocess.TimeoutExpired:
             return create_error_response(
                 ErrorCode.TIMEOUT_ERROR,
-                f"Command execution timed out after 30 seconds: {' '.join(full_cmd)}",
+                f"Command timed out after {actual_timeout} seconds: {' '.join(full_cmd)}",
                 {"command": command},
             )
         except Exception as exc:
@@ -1313,18 +1795,22 @@ def register_file_tools(mcp) -> List[str]:
 
     tool_names = [
         "read_file",
+        "batch_read_files",
         "write_file",
         "create_file",
+        "modify_file",
+        "undo_edit",
         "list_files",
         "get_file_structure",
         "search_in_files",
+        "grep_search",
         "find_function",
         "find_references",
         "get_file_info",
         "analyze_file",
-        "set_project_root",
-        "modify_file",
+        "get_diagnostics",
         "execute_command",
+        "set_project_root",
     ]
     logger.info("Registered %d file-operation tools", len(tool_names))
     return tool_names

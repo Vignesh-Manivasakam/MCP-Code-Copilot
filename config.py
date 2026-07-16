@@ -11,7 +11,7 @@ class Config:
 
     # Server Settings
     SERVER_NAME = "Code Copilot MCP Server"
-    SERVER_VERSION = "1.0.0"
+    SERVER_VERSION = "2.0.0"
     DEFAULT_PORT = 8001
 
     # Project Root - MUST BE SET before starting the server
@@ -58,9 +58,22 @@ class Config:
     # File Read Registry (resolved_path -> { "content": str, "timestamp": float })
     FILE_READ_REGISTRY = {}
 
+    # Edit History for Undo (resolved_path -> { "content": str, "encoding": str })
+    EDIT_HISTORY = {}
+
     # Search Limits
     MAX_SEARCH_RESULTS = 100
     SEARCH_TIMEOUT_SECONDS = 10
+
+    # Batch Read Limits
+    MAX_BATCH_READ_FILES = 10
+
+    # Grep Defaults
+    GREP_CONTEXT_LINES = 2
+    GREP_MAX_RESULTS = 50
+
+    # Command Execution
+    COMMAND_TIMEOUT_MAX = 300  # Maximum allowed timeout in seconds
 
     # Encoding
     DEFAULT_ENCODING = "utf-8"

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-code-copilot"
-version = "1.0.0"
-description = "Secure Model Context Protocol sandbox controller with file inspection metrics"
+version = "2.0.0"
+description = "Super MCP Code Copilot — AI-powered coding agent server with token-optimized file editing, batch reads, diagnostics, and undo support."
 readme = "README.md"
 authors = [
     { name = "Vignesh Manivasakam" }

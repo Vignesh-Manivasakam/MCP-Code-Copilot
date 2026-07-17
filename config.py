@@ -11,7 +11,7 @@ class Config:
 
     # Server Settings
     SERVER_NAME = "Code Copilot MCP Server"
-    SERVER_VERSION = "2.0.0"
+    SERVER_VERSION = "3.0.0"
     DEFAULT_PORT = 8001
 
     # Project Root - MUST BE SET before starting the server

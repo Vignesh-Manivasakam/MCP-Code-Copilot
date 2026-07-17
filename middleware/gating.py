@@ -55,6 +55,13 @@ class GatingRegistry:
         """Returns whether a tool is 'VISIBLE', 'LAZY', or 'HIDDEN' based on current state."""
         self.check_timeout()
         
+        # When no project is configured, only allow project setup tools
+        from config import Config
+        if Config.PROJECT_ROOT is None:
+            if tool_name in ("set_project_root", "get_tool_schema"):
+                return "VISIBLE"
+            return "HIDDEN"
+        
         # Always visible system tools
         if tool_name in ("get_tool_schema", "set_project_root", "get_file_info"):
             return "VISIBLE"

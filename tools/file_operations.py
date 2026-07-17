@@ -1359,6 +1359,18 @@ def register_file_tools(mcp) -> List[str]:
         Config.PROJECT_ROOT = resolved
         logger.info("Project root changed to: %s", resolved)
 
+        # Clear stale state from any previous project
+        Config.FILE_READ_REGISTRY.clear()
+        Config.EDIT_HISTORY.clear()
+
+        # Re-initialize FTS5 search index for the new project
+        try:
+            from services.search_index import initialize_index, index_all_files
+            initialize_index(resolved)
+            index_all_files(resolved)
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not build search index for %s", resolved)
+
         try:
             file_count = sum(1 for p in walk_safe_paths(resolved, "*", recursive=True) if p.is_file())
         except Exception:  # noqa: BLE001
@@ -1370,8 +1382,8 @@ def register_file_tools(mcp) -> List[str]:
                 "project_name": resolved.name,
                 "file_count": file_count,
                 "previous_root": previous,
-            },
-            f"✅ Project root set to: {resolved}  ({file_count} files found)",
+                "message": f"Project root set to: {resolved}  ({file_count} files found)",
+            }
         )
 
     # ------------------------------------------------------------------
@@ -1803,6 +1815,12 @@ def register_file_tools(mcp) -> List[str]:
         - You need to search for variables, class names, or text patterns across all files.
         - You want fast full-text search without scanning directories file-by-file.
         """
+        if Config.PROJECT_ROOT is None:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Server not configured: PROJECT_ROOT is not set. Call set_project_root first.",
+            )
+
         from middleware.gating import gating_registry
         gating_registry.transition("search_codebase")
         
@@ -1836,6 +1854,12 @@ def register_file_tools(mcp) -> List[str]:
         USE THIS WHEN:
         - You want to find where a function, class, or variable is defined.
         """
+        if Config.PROJECT_ROOT is None:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Server not configured: PROJECT_ROOT is not set. Call set_project_root first.",
+            )
+
         from middleware.gating import gating_registry
         gating_registry.transition("lsp_find_definition")
         
@@ -1878,6 +1902,12 @@ def register_file_tools(mcp) -> List[str]:
         USE THIS WHEN:
         - You want to find where a variable, function, or class is used or called.
         """
+        if Config.PROJECT_ROOT is None:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Server not configured: PROJECT_ROOT is not set. Call set_project_root first.",
+            )
+
         from middleware.gating import gating_registry
         gating_registry.transition("lsp_find_references")
         
@@ -1940,16 +1970,24 @@ def register_file_tools(mcp) -> List[str]:
         USE THIS WHEN:
         - You are about to make significant edits and want to save a rollback checkpoint.
         """
+        import subprocess as _git_sp
+
+        if Config.PROJECT_ROOT is None:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Server not configured: PROJECT_ROOT is not set. Call set_project_root first.",
+            )
+
         from middleware.gating import gating_registry
         gating_registry.transition("git_checkpoint")
         
         try:
             # Check if repo is git repository
-            subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=Config.PROJECT_ROOT, capture_output=True, check=True)
+            _git_sp.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=Config.PROJECT_ROOT, capture_output=True, check=True)
             # Stage all changes
-            subprocess.run(["git", "add", "-A"], cwd=Config.PROJECT_ROOT, check=True)
+            _git_sp.run(["git", "add", "-A"], cwd=Config.PROJECT_ROOT, check=True)
             # Commit
-            res = subprocess.run(["git", "commit", "-m", f"checkpoint: {message}"], cwd=Config.PROJECT_ROOT, capture_output=True, text=True)
+            res = _git_sp.run(["git", "commit", "-m", f"checkpoint: {message}"], cwd=Config.PROJECT_ROOT, capture_output=True, text=True)
             return create_success_response({
                 "status": "checkpoint created",
                 "message": message,
@@ -1972,15 +2010,23 @@ def register_file_tools(mcp) -> List[str]:
         USE THIS WHEN:
         - Code modifications or test executions broke the codebase and you want to start over.
         """
+        import subprocess as _git_sp
+
+        if Config.PROJECT_ROOT is None:
+            return create_error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Server not configured: PROJECT_ROOT is not set. Call set_project_root first.",
+            )
+
         from middleware.gating import gating_registry
         gating_registry.transition("git_rollback")
         
         try:
-            subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=Config.PROJECT_ROOT, capture_output=True, check=True)
+            _git_sp.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=Config.PROJECT_ROOT, capture_output=True, check=True)
             # Hard reset to HEAD
-            subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=Config.PROJECT_ROOT, check=True)
+            _git_sp.run(["git", "reset", "--hard", "HEAD"], cwd=Config.PROJECT_ROOT, check=True)
             # Clean untracked files
-            subprocess.run(["git", "clean", "-fd"], cwd=Config.PROJECT_ROOT, check=True)
+            _git_sp.run(["git", "clean", "-fd"], cwd=Config.PROJECT_ROOT, check=True)
             return create_success_response({
                 "status": "rolled back successfully"
             })

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-code-copilot"
-version = "2.0.0"
+version = "3.0.0"
 description = "Super MCP Code Copilot — AI-powered coding agent server with token-optimized file editing, batch reads, diagnostics, and undo support."
 readme = "README.md"
 authors = [

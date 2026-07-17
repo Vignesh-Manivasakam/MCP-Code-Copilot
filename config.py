@@ -31,6 +31,7 @@ class Config:
         "venv",
         "__pycache__",
         ".pytest_cache",
+        ".mcp_index",
         "build",
         "dist",
         ".vscode",

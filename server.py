@@ -1,242 +1,196 @@
 #!/usr/bin/env python3
 """
-Code Copilot MCP Server – Phase 1
-==================================
-A secure, single-folder code-assistance MCP server built on FastMCP v2.
-
-Features
---------
-* 10 Tier-1 file-operation tools
-* Path-traversal protection (hard sandbox at project root)
-* Automatic encoding detection
-* CORS + request-logging middleware
-* Health check and project-info HTTP routes
-
-Usage
------
-    python server.py /path/to/your/project [--port 8000] [--host 127.0.0.1]
+Code Copilot MCP Server – Refactored ASGI Server
+================================================
+Starlette ASGI application mounting FastMCP dual transports (Streamable-HTTP /mcp
+and Server-Sent Events /sse) with Private Network Access (PNA) CORS support and
+OriginGuard bypass.
 """
+from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from pathlib import Path
+import time
 from typing import Optional
 
 from fastmcp import FastMCP
+import fastmcp.settings
+from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 from config import Config
-from tools.file_operations import register_file_tools
-from utils.file_validator import walk_safe_paths
+from copilot.prompts import register_copilot_prompts
+from copilot.tools import register_copilot_tools
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
-    format="%(asctime)s  %(levelname)-8s  %(name)s – %(message)s",
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("copilot.server")
 
 # ---------------------------------------------------------------------------
-# FastMCP instance
+# FastMCP Singleton & Component Registration
 # ---------------------------------------------------------------------------
-
 mcp = FastMCP(Config.SERVER_NAME)
-
-from middleware.gating import setup_gating_middleware
-setup_gating_middleware(mcp)
-
-# ---------------------------------------------------------------------------
-# Custom HTTP routes
-# ---------------------------------------------------------------------------
+_tools_registered = False
 
 
-@mcp.custom_route("/", methods=["GET"])
-@mcp.custom_route("/health", methods=["GET"])
-def health_check(request: Request) -> PlainTextResponse:
-    """Liveness / readiness probe."""
-    if Config.PROJECT_ROOT is None:
-        return PlainTextResponse(
-            "⚠️  Code Copilot MCP Server – no project configured\n",
-            status_code=503,
-        )
-
-    try:
-        file_count = sum(1 for p in walk_safe_paths(Config.PROJECT_ROOT, "*", recursive=True) if p.is_file())
-    except Exception:  # noqa: BLE001
-        file_count = -1
-
-    body = (
-        f"✅ Code Copilot MCP Server v{Config.SERVER_VERSION}\n\n"
-        f"Status  : Running\n"
-        f"Project : {Config.PROJECT_ROOT.name}\n"
-        f"Path    : {Config.PROJECT_ROOT}\n"
-        f"Files   : {file_count}\n"
-        f"Tools   : 12  (Super Copilot – file & commands)\n\n"
-        f"MCP endpoint : /mcp\n"
-    )
-    return PlainTextResponse(body)
+def register_server_tools() -> None:
+    """Idempotently register all consolidated poly-tools, prompts, and resources onto FastMCP."""
+    global _tools_registered
+    if not _tools_registered:
+        register_copilot_tools(mcp)
+        register_copilot_prompts(mcp, include_resources=True)
+        _tools_registered = True
+        logger.info("Registered consolidated poly-tools, prompts, and resources with FastMCP")
 
 
-@mcp.custom_route("/project-info", methods=["GET"])
-def project_info(request: Request) -> JSONResponse:
-    """Return a JSON summary of the current project."""
-    if Config.PROJECT_ROOT is None:
-        return JSONResponse({"error": "No project configured"}, status_code=503)
-
-    root = Config.PROJECT_ROOT
-    all_entries = list(walk_safe_paths(root, "*", recursive=True))
-
-    extension_counts: dict = {}
-    total_size = 0
-
-    for entry in all_entries:
-        if entry.is_file():
-            ext = entry.suffix or ".no_extension"
-            extension_counts[ext] = extension_counts.get(ext, 0) + 1
-            try:
-                total_size += entry.stat().st_size
-            except OSError:
-                pass
-
-    stats = {
-        "project_name": root.name,
-        "project_path": str(root),
-        "total_files": sum(1 for e in all_entries if e.is_file()),
-        "total_directories": sum(1 for e in all_entries if e.is_dir()),
-        "total_size_bytes": total_size,
-        "extensions": extension_counts,
-    }
-    return JSONResponse(stats)
+def initialize_server(project_root: Optional[str | Path] = None) -> None:
+    """Initialize server configuration and register components (backward-compatibility helper)."""
+    if project_root:
+        Config.set_project_root(project_root)
+    register_server_tools()
 
 
 # ---------------------------------------------------------------------------
-# Middleware
+# Inlined Starlette Middleware
 # ---------------------------------------------------------------------------
+class LoggingMiddleware(BaseHTTPMiddleware):
+    """Logs incoming HTTP requests and response latency in milliseconds."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        start = time.perf_counter()
+        logger.info("→ %s %s", request.method, request.url.path)
+        try:
+            response: Response = await call_next(request)
+            elapsed_ms = (time.perf_counter() - start) * 1_000
+            logger.info(
+                "← %s %s %d (%.1f ms)",
+                request.method,
+                request.url.path,
+                response.status_code,
+                elapsed_ms,
+            )
+            return response
+        except Exception:
+            elapsed_ms = (time.perf_counter() - start) * 1_000
+            logger.exception("← %s %s ERROR (%.1f ms)", request.method, request.url.path, elapsed_ms)
+            raise
 
 
-def _build_middleware() -> list:
-    """Compose the middleware stack."""
+def _build_middleware() -> list[Middleware]:
+    """Compose Starlette middleware stack with CORS PNA and request logging."""
     stack = [
         Middleware(
             CORSMiddleware,
             allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_methods=["*"],
             allow_headers=["*"],
+            allow_private_network=Config.CORS_ALLOW_PRIVATE_NETWORK,
             expose_headers=["mcp-session-id", "Mcp-Session-Id", "*"],
         )
     ]
-
-    if Config.ENABLE_REQUEST_LOGGING:
-        from middleware.logging import LoggingMiddleware  # noqa: PLC0415
-
+    if getattr(Config, "ENABLE_REQUEST_LOGGING", True):
         stack.append(Middleware(LoggingMiddleware))
-
     return stack
 
 
 # ---------------------------------------------------------------------------
-# Initialisation
+# Health Check Endpoint
 # ---------------------------------------------------------------------------
+async def health_check(request: Request) -> JSONResponse:
+    """Liveness probe returning standardized server status JSON."""
+    return JSONResponse({
+        "status": "ok",
+        "server": "FastMCP Code Copilot",
+        "version": "0.1.0",
+    })
 
 
-def initialize_server(project_root: Optional[str] = None) -> None:
-    """Register all tools and optionally configure the project root.
-
-    When *project_root* is supplied (CLI argument or env-var), the sandbox is
-    set immediately.  When it is omitted the server starts without a project
-    configured; the client can then call the ``set_project_root`` MCP tool at
-    any time to point the server at a local folder or cloned repository.
+# ---------------------------------------------------------------------------
+# ASGI Application Factory
+# ---------------------------------------------------------------------------
+def create_app(project_root: Optional[str | Path] = None) -> Starlette:
     """
-    logger.info("Initialising Code Copilot MCP Server…")
+    Construct the Starlette ASGI application with dual-transport FastMCP mounting.
 
+    Mounts:
+      - GET /health: Standardized JSON liveness status
+      - GET /: Standardized JSON liveness status
+      - POST/GET/DELETE /mcp: Streamable-HTTP transport
+      - GET /sse: Server-Sent Events stream
+      - POST /messages: SSE client message receiver
+    """
     if project_root:
-        try:
-            Config.set_project_root(project_root)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to configure project root: %s", exc)
-            sys.exit(1)
-        logger.info("✅ Project root: %s", Config.PROJECT_ROOT)
-    else:
-        logger.info(
-            "ℹ️  No project root supplied – call the 'set_project_root' tool "
-            "(or restart with a path argument) to configure one."
-        )
+        Config.set_project_root(project_root)
+    elif Config.PROJECT_ROOT is None:
+        Config.PROJECT_ROOT = Path.cwd().resolve()
+    Config.ensure_directories()
 
-    logger.info("Registering tools…")
-    registered = register_file_tools(mcp)
-    logger.info("✅ Registered tools: %s", registered)
+    # Configure FastMCP origin protection settings
+    fastmcp.settings.http_host_origin_protection = Config.HOST_ORIGIN_PROTECTION
+
+    # Register tools, prompts, and resources
+    register_server_tools()
+
+    # Generate transport sub-apps with OriginGuard bypassed
+    http_sub = mcp.http_app(
+        path="/mcp",
+        transport="streamable-http",
+        host_origin_protection=Config.HOST_ORIGIN_PROTECTION,
+    )
+    sse_sub = mcp.http_app(
+        path="/sse",
+        transport="sse",
+        host_origin_protection=Config.HOST_ORIGIN_PROTECTION,
+    )
+
+    # Combine top-level routes
+    routes = [
+        Route("/health", endpoint=health_check, methods=["GET"]),
+        Route("/", endpoint=health_check, methods=["GET"]),
+        *http_sub.routes,
+        *sse_sub.routes,
+    ]
+
+    return Starlette(
+        routes=routes,
+        middleware=_build_middleware(),
+        lifespan=http_sub.lifespan,
+    )
+
+
+# Module-level ASGI app for standard ASGI runners (e.g. uvicorn server:app)
+app = create_app()
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# CLI Entrypoint
 # ---------------------------------------------------------------------------
+def main() -> None:
+    import uvicorn
 
-
-def main():
-    import uvicorn  # noqa: PLC0415
-
-    parser = argparse.ArgumentParser(
-        description="Code Copilot MCP Server",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "project_root",
-        nargs="?",
-        default=None,
-        help=(
-            "Absolute or relative path to the project folder to expose. "
-            "If omitted the server starts without a project configured – "
-            "use the 'set_project_root' MCP tool to set one at runtime."
-        ),
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=Config.DEFAULT_PORT,
-        help="TCP port to listen on",
-    )
-    parser.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="Network interface to bind (use 0.0.0.0 for all interfaces)",
-    )
-
+    parser = argparse.ArgumentParser(description="Code Copilot MCP Server")
+    parser.add_argument("project_root", nargs="?", default=None, help="Path to project root directory")
+    parser.add_argument("--port", type=int, default=Config.DEFAULT_PORT, help="Port to listen on")
+    parser.add_argument("--host", default=Config.DEFAULT_HOST, help="Host to bind to")
     args = parser.parse_args()
 
-    initialize_server(args.project_root)
-
-    http_app = mcp.http_app(path="/mcp", middleware=_build_middleware())
-
-    separator = "=" * 60
-    print(separator)
-    print(f"🚀 Code Copilot MCP Server  v{Config.SERVER_VERSION}")
-    print(separator)
-    if Config.PROJECT_ROOT:
-        print(f"  Project : {Config.PROJECT_ROOT}")
-    else:
-        print("  Project : ⚠️  NOT CONFIGURED")
-        print("            → Ask the assistant to call 'set_project_root'")
-        print("              or restart with:  python server.py <folder>")
+    application = create_app(args.project_root)
+    print("=" * 60)
+    print(f"🚀 Code Copilot MCP Server v{Config.SERVER_VERSION}")
+    print(f"  Project : {Config.PROJECT_ROOT}")
     print(f"  MCP     : http://{args.host}:{args.port}/mcp")
+    print(f"  SSE     : http://{args.host}:{args.port}/sse")
     print(f"  Health  : http://{args.host}:{args.port}/health")
-    print(separator)
-    if not Config.PROJECT_ROOT:
-        print("ℹ️  Tell the assistant which project folder or repo you want to work on.\n")
-    else:
-        print("Ready – press Ctrl+C to stop.\n")
+    print("=" * 60)
 
-    try:
-        uvicorn.run(http_app, host=args.host, port=args.port)
-    except KeyboardInterrupt:
-        print("\n✅ Server stopped.")
+    uvicorn.run(application, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

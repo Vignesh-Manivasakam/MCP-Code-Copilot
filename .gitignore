@@ -1,11 +1,51 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# FastMCP Copilot runtime state, history, and search index
+.copilot/
+.mcp_index/
+.agents/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Testing & Coverage
 .pytest_cache/
-*.bak
+.coverage
+htmlcov/
+
+# Build artifacts & packaging
 dist/
 build/
 *.egg-info/
-.venv/
-venv/
-.mcp_index/
+*.egg
+
+# Backup and temporary files
+*.bak
+*.swp
+*~
+
+# Environment & Secrets (Path Jail Protection)
+.env
+.env.*
+.secrets
+
+# Node / JS dependencies (Excluded Directory Hygiene)
+node_modules/
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

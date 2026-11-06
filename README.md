@@ -134,8 +134,6 @@ MCP-Code-Copilot/
 ├── config.py                       # Centralized configuration & thresholds
 ├── pyproject.toml                  # Explicit package discovery specification
 ├── server.py                       # Starlette ASGI dual-transport server (/mcp & /sse)
-├── CLAUDE.md                       # Project coding standards and guidelines
-├── TEST_READY.md                   # Comprehensive test verification matrix
 └── README.md                       # Master documentation
 ```
 

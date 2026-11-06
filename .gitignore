@@ -30,6 +30,12 @@ dist/
 build/
 *.egg-info/
 *.egg
+*.lock
+uv.lock
+
+# Agent instructions & temporary run reports
+CLAUDE*.md
+TEST_READY.md
 
 # Backup and temporary files
 *.bak
